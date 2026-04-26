@@ -1,0 +1,129 @@
+name: 🔍 Secret Leak Scanner + Discord Alert
+
+on:
+  schedule:
+    # شغل كل يوم الساعة 3 صباحاً UTC
+    - cron: "0 3 * * *"
+  workflow_dispatch:  # تشغيل يدوي كمان
+
+jobs:
+  scan-secrets:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    
+    steps:
+      # ─── 1. Checkout الكود مع full history ───
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # مهم جداً عشان نفحص كل الـ history
+
+      # ─── 2. حساب تاريخ آخر سنتين ───
+      - name: Calculate 2-year cutoff date
+        id: date
+        run: |
+          CUTOFF=$(date -d "2 years ago" +%Y-%m-%d)
+          echo "cutoff=$CUTOFF" >> $GITHUB_OUTPUT
+          echo "Scanning commits since: $CUTOFF"
+
+      # ─── 3. تثبيت TruffleHog ───
+      - name: Install TruffleHog
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
+          trufflehog --version
+
+      # ─── 4. فحص الـ Git History (آخر سنتين بس) ───
+      - name: Scan Git History (Last 2 Years)
+        id: scan
+        run: |
+          set -euo pipefail
+          
+          CUTOFF="${{ steps.date.outputs.cutoff }}"
+          TMP_JSON="$RUNNER_TEMP/trufflehog-results.json"
+          
+          # فحص الـ git history من آخر سنتين
+          trufflehog git "file://$GITHUB_WORKSPACE" \
+            --since-commit="$CUTOFF" \
+            --json \
+            --no-update \
+            --results=verified,unknown \
+            --force-skip-binaries \
+            --archive-max-size=5MB \
+            > "$TMP_JSON" 2>/dev/null || true
+          
+          # عد النتائج
+          if [ -s "$TMP_JSON" ]; then
+            COUNT=$(jq -c . "$TMP_JSON" | wc -l | tr -d ' ')
+            echo "count=$COUNT" >> $GITHUB_OUTPUT
+            cp "$TMP_JSON" trufflehog-results.json
+            echo "Found $COUNT potential secrets"
+          else
+            echo "count=0" >> $GITHUB_OUTPUT
+            echo "[]" > trufflehog-results.json
+            echo "No secrets found"
+          fi
+
+      # ─── 5. إعداد رسالة Discord ───
+      - name: Prepare Discord Message
+        if: steps.scan.outputs.count != '0'
+        id: discord
+        run: |
+          REPO="${{ github.repository }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          
+          # بناء الرسالة
+          jq -n \
+            --arg repo "$REPO" \
+            --arg count "${{ steps.scan.outputs.count }}" \
+            --arg url "$RUN_URL" \
+            --arg cutoff "${{ steps.date.outputs.cutoff }}" \
+            '{
+              "username": "🔐 Secret Scanner",
+              "avatar_url": "https://cdn-icons-png.flaticon.com/512/3064/3064197.png",
+              "embeds": [{
+                "title": "🚨 Secrets Detected!",
+                "description": "Found **\($count)** potential secret(s) in repository **\($repo)**",
+                "color": 15158332,
+                "fields": [
+                  {
+                    "name": "📅 Scan Period",
+                    "value": "Since \($cutoff) (last 2 years)",
+                    "inline": true
+                  },
+                  {
+                    "name": "🔗 Run Details",
+                    "value": "[View Workflow Run](\($url))",
+                    "inline": true
+                  }
+                ],
+                "footer": {
+                  "text": "TruffleHog Secret Scanner"
+                },
+                "timestamp": now | todate
+              }]
+            }' > discord-payload.json
+
+      # ─── 6. إرسال لـ Discord ───
+      - name: Send Alert to Discord
+        if: steps.scan.outputs.count != '0'
+        run: |
+          curl -X POST "${{ secrets.DISCORD_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d @discord-payload.json
+
+      # ─── 7. رفع الـ JSON كـ Artifact (لو فيه نتائج) ───
+      - name: Upload Results
+        if: steps.scan.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trufflehog-findings
+          path: trufflehog-results.json
+
+      # ─── 8. فشل الـ Workflow لو لقينا secrets (اختياري) ───
+      - name: Fail on Secrets Found
+        if: steps.scan.outputs.count != '0'
+        run: |
+          echo "::error::Found ${{ steps.scan.outputs.count }} potential secrets! Check Discord or artifacts."
+          exit 1
