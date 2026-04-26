@@ -6,124 +6,187 @@ on:
     - cron: "0 3 * * *"
   workflow_dispatch:  # تشغيل يدوي كمان
 
+env:
+  # ════════════════════════════════════════
+  # ✏️ اكتب هنا اسم الـ Domain أو الـ Org:
+  # ════════════════════════════════════════
+  TARGET_DOMAIN: "newegg.com"    # ← غير ده لأي اسم org أو domain
+  # ════════════════════════════════════════
+
 jobs:
   scan-secrets:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: read
-    
-    steps:
-      # ─── 1. Checkout الكود مع full history ───
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # مهم جداً عشان نفحص كل الـ history
 
-      # ─── 2. حساب تاريخ آخر سنتين ───
-      - name: Calculate 2-year cutoff date
+    steps:
+      # ─── 1. حساب تاريخ آخر سنتين ───
+      - name: Calculate 2-Year Cutoff
         id: date
         run: |
           CUTOFF=$(date -d "2 years ago" +%Y-%m-%d)
           echo "cutoff=$CUTOFF" >> $GITHUB_OUTPUT
-          echo "Scanning commits since: $CUTOFF"
+          echo "🔍 Scanning since: $CUTOFF"
 
-      # ─── 3. تثبيت TruffleHog ───
+      # ─── 2. تثبيت TruffleHog ───
       - name: Install TruffleHog
         run: |
           curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
           trufflehog --version
 
-      # ─── 4. فحص الـ Git History (آخر سنتين بس) ───
-      - name: Scan Git History (Last 2 Years)
+      # ─── 3. جلب كل repos في الـ Domain/Org ───
+      - name: Fetch Repositories from ${{ env.TARGET_DOMAIN }}
+        id: fetch
+        run: |
+          ORG="${{ env.TARGET_DOMAIN }}"
+          TMP_DIR="$RUNNER_TEMP/repos"
+          mkdir -p "$TMP_DIR"
+          
+          echo "📂 Fetching repos from: $ORG"
+          
+          # جلب كل public repos من الـ org (max 100)
+          curl -s "https://api.github.com/orgs/$ORG/repos?per_page=100" > "$TMP_DIR/repos.json"
+          
+          # عدد الـ repos
+          REPO_COUNT=$(cat "$TMP_DIR/repos.json" | jq 'length')
+          echo "count=$REPO_COUNT" >> $GITHUB_OUTPUT
+          echo "📦 Found $REPO_COUNT repositories"
+          
+          # استخراج الـ clone URLs
+          cat "$TMP_DIR/repos.json" | jq -r '.[].clone_url' > "$TMP_DIR/repo-list.txt"
+
+      # ─── 4. فحص كل repo (آخر سنتين بس) ───
+      - name: Scan All Repos for Secrets
         id: scan
         run: |
-          set -euo pipefail
-          
           CUTOFF="${{ steps.date.outputs.cutoff }}"
-          TMP_JSON="$RUNNER_TEMP/trufflehog-results.json"
+          RESULTS_FILE="$RUNNER_TEMP/all-results.jsonl"
+          touch "$RESULTS_FILE"
           
-          # فحص الـ git history من آخر سنتين
-          trufflehog git "file://$GITHUB_WORKSPACE" \
-            --since-commit="$CUTOFF" \
-            --json \
-            --no-update \
-            --results=verified,unknown \
-            --force-skip-binaries \
-            --archive-max-size=5MB \
-            > "$TMP_JSON" 2>/dev/null || true
+          TOTAL_SECRETS=0
           
-          # عد النتائج
-          if [ -s "$TMP_JSON" ]; then
-            COUNT=$(jq -c . "$TMP_JSON" | wc -l | tr -d ' ')
-            echo "count=$COUNT" >> $GITHUB_OUTPUT
-            cp "$TMP_JSON" trufflehog-results.json
-            echo "Found $COUNT potential secrets"
-          else
-            echo "count=0" >> $GITHUB_OUTPUT
-            echo "[]" > trufflehog-results.json
-            echo "No secrets found"
-          fi
+          while IFS= read -r repo_url; do
+            [ -z "$repo_url" ] && continue
+            
+            REPO_NAME=$(basename "$repo_url" .git)
+            CLONE_DIR="$RUNNER_TEMP/$REPO_NAME"
+            
+            echo "🔎 Scanning: $REPO_NAME"
+            
+            # Clone bare (سريع)
+            git clone --bare --depth=1 "$repo_url" "$CLONE_DIR" 2>/dev/null || {
+              echo "   ⚠️ Failed to clone $REPO_NAME"
+              continue
+            }
+            
+            # فحص بـ TruffleHog (آخر سنتين)
+            REPO_RESULTS="$RUNNER_TEMP/${REPO_NAME}-results.jsonl"
+            
+            trufflehog git "file://$CLONE_DIR" \
+              --since-commit="$CUTOFF" \
+              --json \
+              --no-update \
+              --results=verified,unknown \
+              --force-skip-binaries \
+              > "$REPO_RESULTS" 2>/dev/null || true
+            
+            # عد النتائج
+            if [ -s "$REPO_RESULTS" ]; then
+              REPO_COUNT=$(wc -l < "$REPO_RESULTS" | tr -d ' ')
+              TOTAL_SECRETS=$((TOTAL_SECRETS + REPO_COUNT))
+              cat "$REPO_RESULTS" >> "$RESULTS_FILE"
+              echo "   🚨 Found $REPO_COUNT secrets in $REPO_NAME"
+            else
+              echo "   ✅ Clean"
+            fi
+            
+            # تنظيف
+            rm -rf "$CLONE_DIR" "$REPO_RESULTS"
+            
+          done < "$RUNNER_TEMP/repos/repo-list.txt"
+          
+          echo "total=$TOTAL_SECRETS" >> $GITHUB_OUTPUT
+          cp "$RESULTS_FILE" trufflehog-results.jsonl
+          
+          echo "═══════════════════════════════════════"
+          echo "🎯 Total secrets found: $TOTAL_SECRETS"
+          echo "═══════════════════════════════════════"
 
       # ─── 5. إعداد رسالة Discord ───
-      - name: Prepare Discord Message
-        if: steps.scan.outputs.count != '0'
+      - name: Prepare Discord Alert
+        if: steps.scan.outputs.total != '0'
         id: discord
         run: |
-          REPO="${{ github.repository }}"
+          ORG="${{ env.TARGET_DOMAIN }}"
+          COUNT="${{ steps.scan.outputs.total }}"
+          REPO_COUNT="${{ steps.fetch.outputs.count }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          CUTOFF="${{ steps.date.outputs.cutoff }}"
           
-          # بناء الرسالة
           jq -n \
-            --arg repo "$REPO" \
-            --arg count "${{ steps.scan.outputs.count }}" \
+            --arg org "$ORG" \
+            --arg count "$COUNT" \
+            --arg repos "$REPO_COUNT" \
             --arg url "$RUN_URL" \
-            --arg cutoff "${{ steps.date.outputs.cutoff }}" \
+            --arg cutoff "$CUTOFF" \
             '{
-              "username": "🔐 Secret Scanner",
+              "username": "🔐 Secret Scanner Bot",
               "avatar_url": "https://cdn-icons-png.flaticon.com/512/3064/3064197.png",
+              "content": "@here 🚨 Secrets detected!",
               "embeds": [{
-                "title": "🚨 Secrets Detected!",
-                "description": "Found **\($count)** potential secret(s) in repository **\($repo)**",
+                "title": "🔍 Scan Results: " + $org,
+                "description": "Found **" + $count + "** potential secret(s) across **" + $repos + "** repositories",
                 "color": 15158332,
                 "fields": [
                   {
-                    "name": "📅 Scan Period",
-                    "value": "Since \($cutoff) (last 2 years)",
+                    "name": "🌐 Target Domain",
+                    "value": $org,
                     "inline": true
                   },
                   {
-                    "name": "🔗 Run Details",
-                    "value": "[View Workflow Run](\($url))",
+                    "name": "📅 Scan Period",
+                    "value": "Since " + $cutoff + " (last 2 years)",
                     "inline": true
+                  },
+                  {
+                    "name": "📊 Repositories Scanned",
+                    "value": $repos,
+                    "inline": true
+                  },
+                  {
+                    "name": "🔗 Workflow Run",
+                    "value": "[View Details](" + $url + ")",
+                    "inline": false
                   }
                 ],
                 "footer": {
-                  "text": "TruffleHog Secret Scanner"
+                  "text": "Powered by TruffleHog"
                 },
                 "timestamp": now | todate
               }]
             }' > discord-payload.json
 
       # ─── 6. إرسال لـ Discord ───
-      - name: Send Alert to Discord
-        if: steps.scan.outputs.count != '0'
+      - name: Send Discord Alert
+        if: steps.scan.outputs.total != '0'
         run: |
           curl -X POST "${{ secrets.DISCORD_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
             -d @discord-payload.json
+          
+          echo "📨 Discord alert sent!"
 
-      # ─── 7. رفع الـ JSON كـ Artifact (لو فيه نتائج) ───
+      # ─── 7. رفع النتائج كـ Artifact ───
       - name: Upload Results
-        if: steps.scan.outputs.count != '0'
+        if: steps.scan.outputs.total != '0'
         uses: actions/upload-artifact@v4
         with:
-          name: trufflehog-findings
-          path: trufflehog-results.json
+          name: secrets-found-${{ env.TARGET_DOMAIN }}
+          path: trufflehog-results.jsonl
 
-      # ─── 8. فشل الـ Workflow لو لقينا secrets (اختياري) ───
-      - name: Fail on Secrets Found
-        if: steps.scan.outputs.count != '0'
+      # ─── 8. فشل لو لقينا secrets (تنبيه) ───
+      - name: Alert on Secrets Found
+        if: steps.scan.outputs.total != '0'
         run: |
-          echo "::error::Found ${{ steps.scan.outputs.count }} potential secrets! Check Discord or artifacts."
+          echo "::error::🚨 Found ${{ steps.scan.outputs.total }} secrets in ${{ env.TARGET_DOMAIN }}!"
           exit 1
