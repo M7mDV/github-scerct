@@ -2,15 +2,14 @@ name: 🔍 Secret Leak Scanner + Discord Alert
 
 on:
   schedule:
-    # شغل كل يوم الساعة 3 صباحاً UTC
     - cron: "0 3 * * *"
-  workflow_dispatch:  # تشغيل يدوي كمان
+  workflow_dispatch:
 
 env:
   # ════════════════════════════════════════
-  # ✏️ اكتب هنا اسم الـ Domain أو الـ Org:
+  # ✏️ اكتب هنا الـ URL الكامل للـ Repo:
   # ════════════════════════════════════════
-  TARGET_DOMAIN: "yahoo"    # ← غير ده لأي اسم org أو domain
+  TARGET_REPO: "https://github.com/slackhq/nebula"
   # ════════════════════════════════════════
 
 jobs:
@@ -34,123 +33,77 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
           trufflehog --version
 
-      # ─── 3. جلب كل repos في الـ Domain/Org ───
-      - name: Fetch Repositories from ${{ env.TARGET_DOMAIN }}
-        id: fetch
+      # ─── 3. استخراج اسم الـ Repo ───
+      - name: Parse Repo Info
+        id: parse
         run: |
-          ORG="${{ env.TARGET_DOMAIN }}"
-          TMP_DIR="$RUNNER_TEMP/repos"
-          mkdir -p "$TMP_DIR"
-          
-          echo "📂 Fetching repos from: $ORG"
-          
-          # جلب كل public repos من الـ org (max 100)
-          curl -s "https://api.github.com/orgs/$ORG/repos?per_page=100" > "$TMP_DIR/repos.json"
-          
-          # عدد الـ repos
-          REPO_COUNT=$(cat "$TMP_DIR/repos.json" | jq 'length')
-          echo "count=$REPO_COUNT" >> $GITHUB_OUTPUT
-          echo "📦 Found $REPO_COUNT repositories"
-          
-          # استخراج الـ clone URLs
-          cat "$TMP_DIR/repos.json" | jq -r '.[].clone_url' > "$TMP_DIR/repo-list.txt"
+          REPO_URL="${{ env.TARGET_REPO }}"
+          REPO_NAME=$(basename "$REPO_URL")
+          REPO_SLUG=$(echo "$REPO_URL" | sed 's|https://github.com/||')
+          echo "name=$REPO_NAME"   >> $GITHUB_OUTPUT
+          echo "slug=$REPO_SLUG"   >> $GITHUB_OUTPUT
+          echo "url=${REPO_URL}.git" >> $GITHUB_OUTPUT
+          echo "📦 Target: $REPO_SLUG"
 
-      # ─── 4. فحص كل repo (آخر سنتين بس) ───
-      - name: Scan All Repos for Secrets
+      # ─── 4. فحص الـ Repo ───
+      - name: Scan Repo for Secrets
         id: scan
         run: |
           CUTOFF="${{ steps.date.outputs.cutoff }}"
-          RESULTS_FILE="$RUNNER_TEMP/all-results.jsonl"
-          touch "$RESULTS_FILE"
-          
-          TOTAL_SECRETS=0
-          
-          while IFS= read -r repo_url; do
-            [ -z "$repo_url" ] && continue
-            
-            REPO_NAME=$(basename "$repo_url" .git)
-            CLONE_DIR="$RUNNER_TEMP/$REPO_NAME"
-            
-            echo "🔎 Scanning: $REPO_NAME"
-            
-            # Clone bare (سريع)
-            git clone --bare --depth=1 "$repo_url" "$CLONE_DIR" 2>/dev/null || {
-              echo "   ⚠️ Failed to clone $REPO_NAME"
-              continue
-            }
-            
-            # فحص بـ TruffleHog (آخر سنتين)
-            REPO_RESULTS="$RUNNER_TEMP/${REPO_NAME}-results.jsonl"
-            
-            trufflehog git "file://$CLONE_DIR" \
-              --since-commit="$CUTOFF" \
-              --json \
-              --no-update \
-              --results=verified,unknown \
-              --force-skip-binaries \
-              > "$REPO_RESULTS" 2>/dev/null || true
-            
-            # عد النتائج
-            if [ -s "$REPO_RESULTS" ]; then
-              REPO_COUNT=$(wc -l < "$REPO_RESULTS" | tr -d ' ')
-              TOTAL_SECRETS=$((TOTAL_SECRETS + REPO_COUNT))
-              cat "$REPO_RESULTS" >> "$RESULTS_FILE"
-              echo "   🚨 Found $REPO_COUNT secrets in $REPO_NAME"
-            else
-              echo "   ✅ Clean"
-            fi
-            
-            # تنظيف
-            rm -rf "$CLONE_DIR" "$REPO_RESULTS"
-            
-          done < "$RUNNER_TEMP/repos/repo-list.txt"
-          
-          echo "total=$TOTAL_SECRETS" >> $GITHUB_OUTPUT
-          cp "$RESULTS_FILE" trufflehog-results.jsonl
-          
+          REPO_NAME="${{ steps.parse.outputs.name }}"
+          CLONE_URL="${{ steps.parse.outputs.url }}"
+          RESULTS_FILE="trufflehog-results.jsonl"
+
+          echo "🔎 Cloning: $CLONE_URL"
+          git clone --bare --depth=1 "$CLONE_URL" "$RUNNER_TEMP/$REPO_NAME"
+
+          echo "🔎 Scanning..."
+          trufflehog git "file://$RUNNER_TEMP/$REPO_NAME" \
+            --since-commit="$CUTOFF" \
+            --json \
+            --no-update \
+            --results=verified,unknown \
+            --force-skip-binaries \
+            > "$RESULTS_FILE" 2>/dev/null || true
+
+          TOTAL=$(wc -l < "$RESULTS_FILE" | tr -d ' ')
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+
           echo "═══════════════════════════════════════"
-          echo "🎯 Total secrets found: $TOTAL_SECRETS"
+          echo "🎯 Total secrets found: $TOTAL"
           echo "═══════════════════════════════════════"
 
       # ─── 5. إعداد رسالة Discord ───
       - name: Prepare Discord Alert
         if: steps.scan.outputs.total != '0'
-        id: discord
         run: |
-          ORG="${{ env.TARGET_DOMAIN }}"
+          SLUG="${{ steps.parse.outputs.slug }}"
           COUNT="${{ steps.scan.outputs.total }}"
-          REPO_COUNT="${{ steps.fetch.outputs.count }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           CUTOFF="${{ steps.date.outputs.cutoff }}"
-          
+
           jq -n \
-            --arg org "$ORG" \
+            --arg slug "$SLUG" \
             --arg count "$COUNT" \
-            --arg repos "$REPO_COUNT" \
             --arg url "$RUN_URL" \
+            --arg repo_url "${{ env.TARGET_REPO }}" \
             --arg cutoff "$CUTOFF" \
             '{
               "username": "🔐 Secret Scanner Bot",
-              "avatar_url": "https://cdn-icons-png.flaticon.com/512/3064/3064197.png",
               "content": "@here 🚨 Secrets detected!",
               "embeds": [{
-                "title": "🔍 Scan Results: " + $org,
-                "description": "Found **" + $count + "** potential secret(s) across **" + $repos + "** repositories",
+                "title": "🔍 Scan Results: " + $slug,
+                "description": "Found **" + $count + "** potential secret(s)",
                 "color": 15158332,
                 "fields": [
                   {
-                    "name": "🌐 Target Domain",
-                    "value": $org,
+                    "name": "📁 Repository",
+                    "value": "[" + $slug + "](" + $repo_url + ")",
                     "inline": true
                   },
                   {
                     "name": "📅 Scan Period",
-                    "value": "Since " + $cutoff + " (last 2 years)",
-                    "inline": true
-                  },
-                  {
-                    "name": "📊 Repositories Scanned",
-                    "value": $repos,
+                    "value": "Since " + $cutoff,
                     "inline": true
                   },
                   {
@@ -159,9 +112,7 @@ jobs:
                     "inline": false
                   }
                 ],
-                "footer": {
-                  "text": "Powered by TruffleHog"
-                },
+                "footer": { "text": "Powered by TruffleHog" },
                 "timestamp": now | todate
               }]
             }' > discord-payload.json
@@ -173,20 +124,19 @@ jobs:
           curl -X POST "${{ secrets.DISCORD_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
             -d @discord-payload.json
-          
           echo "📨 Discord alert sent!"
 
-      # ─── 7. رفع النتائج كـ Artifact ───
+      # ─── 7. رفع النتائج ───
       - name: Upload Results
         if: steps.scan.outputs.total != '0'
         uses: actions/upload-artifact@v4
         with:
-          name: secrets-found-${{ env.TARGET_DOMAIN }}
+          name: secrets-found-${{ steps.parse.outputs.name }}
           path: trufflehog-results.jsonl
 
-      # ─── 8. فشل لو لقينا secrets (تنبيه) ───
+      # ─── 8. فشل لو لقينا secrets ───
       - name: Alert on Secrets Found
         if: steps.scan.outputs.total != '0'
         run: |
-          echo "::error::🚨 Found ${{ steps.scan.outputs.total }} secrets in ${{ env.TARGET_DOMAIN }}!"
+          echo "::error::🚨 Found ${{ steps.scan.outputs.total }} secrets in ${{ steps.parse.outputs.slug }}!"
           exit 1
